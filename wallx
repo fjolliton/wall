@@ -1,0 +1,392 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+# Create wallpapers to spread an image accross multiple monitors and machines.
+#
+# This file is part of Wallx.  Wallx is free software: you can
+# redistribute it and/or modify it under the terms of the GNU General Public
+# License as published by the Free Software Foundation, version 2.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more
+# details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program; if not, write to the Free Software Foundation, Inc., 51
+# Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+# Copyright 2013 - Frédéric Jolliton <frederic@jolliton.com>
+#
+
+from __future__ import print_function
+
+import os
+import re
+import sys
+import getopt
+import subprocess
+
+def compute_boxes(screens):
+    """
+    Update screen specification with box info.
+
+    screens -- (list) list of screen spec to update.
+
+    Each entry will be added the following value in the `box' key:
+
+        {
+         'left': ..,   # left border in meter
+         'right': ..,  # right border in meter
+         'top': ..,    # top border in meter
+         'bottom': ..  # bottom border in meter
+        }
+    """
+    right_m = 0.0
+    top_offset = min(screen.get('top', 0.0) for screen in screens)
+    for screen in screens:
+        width_m = screen['width'] / float(screen['density'])
+        height_m = screen['height'] / float(screen['density'])
+        left_m = right_m + screen.get('gap', 0.0)
+        right_m = left_m + width_m
+        top_m = float(screen.get('top', 0.0)) - top_offset
+        bottom_m = top_m + height_m
+        screen['box'] = {'left': left_m, 'right': right_m, 'top': top_m, 'bottom': bottom_m}
+
+def get_image_size(f):
+    """
+    Get image size using ImageMagick tool.
+
+    f -- (str) the image filename.
+
+    Return (width, height) in pixel.
+    """
+    return map(int, subprocess.check_output(['identify', '-format', '%w %h', f]).split())
+
+def process(src, target, screens, gravity_x=0.5, gravity_y=0.5, scale=1.0, verbose=False, pretend=False, region=None):
+    """
+    src -- (str) the image to process.
+    target -- (str) the image to produce.
+    screens -- (str) the screens specification
+    gravity_x, gravity_y -- (float) [0..1] where 0.5 mean center.
+    verbose -- (bool) show extra info on stdout.
+    pretend -- (bool) show what would be done, but do nothing.
+    region -- (None|dict) a region to restrict the operation on a part
+      of the image. Gravity and scale act on the restricted region.
+    """
+    width, height = get_image_size(src)
+    if verbose:
+        print('Source image: {} x {}'.format(width, height))
+
+    if region:
+        region_x = region['x'] if region['x_side'] == '+' else width - region['x'] - region['width']
+        region_y = region['y'] if region['y_side'] == '+' else height - region['y'] - region['height']
+        region_width = region['width']
+        region_height = region['height']
+        assert 0 <= region_x <= width and 0 <= region_x + region_width <= width
+        assert 0 <= region_y <= height and 0 <= region_y + region_height <= height
+    else:
+        region_x = 0
+        region_y = 0
+        region_width = width
+        region_height = height
+
+    all_screens = sum(screens, [])
+    compute_boxes(all_screens)
+
+    left   = min(screen['box']['left']   for screen in all_screens)
+    right  = max(screen['box']['right']  for screen in all_screens)
+    top    = min(screen['box']['top']    for screen in all_screens)
+    bottom = max(screen['box']['bottom'] for screen in all_screens)
+
+    if (bottom - top) / (right - left) < float(region_height) / float(region_width):
+        # Full width
+        ratio = float(region_width) / (right - left) / scale
+    else:
+        # Full height
+        ratio = float(region_height) / (bottom - top) / scale
+
+    x_offset = gravity_x * (region_width - (right - left) * ratio) + region_x
+    y_offset = gravity_y * (region_height - (bottom - top) * ratio) + region_y
+
+    for p, part in enumerate(screens, 1):
+        images = []
+        for i, screen in enumerate(part, 1):
+            box = screen['box']
+            box_target = '.tmp_box{}.png'.format(i)
+            x1 = (box['left'] - left) * ratio + x_offset
+            x2 = (box['right'] - left) * ratio + x_offset
+            y1 = (box['top'] - top) * ratio + y_offset
+            y2 = (box['bottom'] - top) * ratio + y_offset
+            width_p = int(round(x2-x1))
+            height_p = int(round(y2-y1))
+            left_p = int(round(x1))
+            top_p = int(round(y1))
+            assert 0 <= left_p < width and 0 <= width_p <= width and left_p + width_p <= width
+            assert 0 <= top_p < height and 0 <= height_p <= height and top_p + height_p <= height
+            if verbose:
+                print('Extracting ({},{})-({},{})'.format(left_p, top_p, left_p+width_p, top_p+height_p))
+            cmd = [
+                'convert',
+                src,
+                '-crop', '{}x{}+{}+{}'.format(width_p, height_p, left_p, top_p),
+                '+repage',
+                '-resize', '{}x{}!'.format(screen['width'], screen['height']),
+                box_target
+            ]
+            if verbose or pretend:
+                print(' '.join(cmd))
+            if not pretend:
+                subprocess.call(cmd)
+            images.append(box_target)
+
+        if len(screens) > 1:
+            part_target = os.path.join(os.path.dirname(target), '{}_{}'.format(p, os.path.basename(target)))
+        else:
+            part_target = target
+        cmd = ['convert'] + images + ['+append', part_target]
+        if verbose or pretend:
+            print(' '.join(cmd))
+        if not pretend:
+            subprocess.call(cmd)
+            for item in images:
+                os.unlink(item)
+
+def parse_density(width, value, unit):
+    """
+    width -- (int) width in pixel (required if the value is based on
+      the width.)
+    value -- (str) the float value to parse.
+    unit -- (None|str) an unit name.
+
+    Return a value in pixel-per-meter.
+
+    >>> parse_density(1920, '4557.8', None)
+    4557.8
+    >>> parse_density(1920, '4557.8', 'ppm')
+    4557.8
+    >>> parse_density(1920, '92', 'dpi')
+    3622.047244094488
+    >>> parse_density(1680, '46.5', 'cm')
+    3612.903225806452
+    """
+    value = float(value)
+    if not unit or unit == 'ppm':
+        pass
+    elif unit == 'dpi':
+        value /= 0.0254
+    elif unit == 'in':
+        value = width / (0.0254 * value)
+    elif unit == 'm':
+        value = width / value
+    elif unit == 'cm':
+        value = width * 100 / value
+    elif unit == 'mm':
+        value = width * 1000 / value
+    else:
+        raise ValueError('Invalid unit', unit)
+    return value
+
+def parse_length(value, unit):
+    """
+    Return a value in meter.
+    """
+    if value is not None:
+        value = float(value)
+        if not unit or unit == 'm':
+            pass
+        elif unit == 'in':
+            value *= 0.0254
+        elif unit == 'cm':
+            value /= 100
+        elif unit == 'mm':
+            value /= 1000
+        else:
+            raise ValueError('Invalid unit')
+        return value
+
+re_spec = re.compile(r'^'
+                     r'(?P<width>[0-9]+)x(?P<height>[0-9]+)' # dimension
+                     r'/(?P<density>[0-9]+(?:\.[0-9]*)?)(?P<density_unit>[a-z]+)' # density
+                     r'(?:@(?P<top>-?[0-9]+(?:\.[0-9]*)?)(?P<top_unit>[a-z]+)?)?' # top offset
+                     r'(?:\+(?P<gap>[0-9]+(?:\.[0-9]*)?)(?P<gap_unit>[a-z]+)?)?' # gap
+                     r'$')
+
+def parse_screen_spec(s):
+    """
+    """
+    r = re_spec.match(s)
+    if r is not None:
+        g = r.groupdict()
+        return {
+            'width': int(g['width']),
+            'height': int(g['height']),
+            'density': parse_density(int(g['width']), g['density'], g['density_unit']),
+            'top': parse_length(g['top'], g['top_unit']) or 0.0,
+            'gap': parse_length(g['gap'], g['gap_unit']) or 0.0
+        }
+
+re_region = re.compile('^'
+                       '(?P<width>[0-9]+)x(?P<height>[0-9]+)'
+                       '((?P<x_side>[-+])(?P<x>[0-9]+))?'
+                       '((?P<y_side>[-+])(?P<y>[0-9]+))?'
+                       '$')
+
+def parse_region(s):
+    """
+    """
+    r = re_region.match(s)
+    if r is not None:
+        g = r.groupdict()
+        return {
+            'width': int(g['width']),
+            'height': int(g['height']),
+            'x': int(g['x'] or 0), 'x_side': g['x_side'] or '+',
+            'y': int(g['y'] or 0), 'y_side': g['y_side'] or '+'
+        }
+
+#-----------------------------------------------------------------------------
+
+def exit_with_usage(rc):
+    print("""\
+Usage: {0} [OPTIONS] INPUT OUTPUT
+
+ -h, --help            Print this help.
+ -s, --screen=SPEC     Define a screen. See below.
+ -t, --then            Start a new set of screens.
+ -C, --crop=CROP_SPEC  Limit the action on a subpart of the input image.
+ -x, --xcenter=FLOAT   The gravity in the X direction. Default to 0.5.
+ -y, --ycenter=FLOAT   The gravity in the Y direction. Default to 0.5.
+ -S, --scale=FLOAT     Scale the image. Default to 1.0. Must be >= 1.0.
+ -p, --pretend         Just show what command would be run, but do nothing.
+ -v, --verbose         Verbose output.
+
+At least one screen should be specified.
+
+Screen specification:
+
+  The format is <width>x<height>/<ppm>[@<top>][+<gap>], where:
+
+   * `width' is the screen width in pixel
+
+   * `height' is the screen height in pixel
+
+   * `ppm' is the screen density (pixel per meter). It is possible to
+     specify a density in DPI by using the "dpi" suffix. See examples
+     below. Alternatively, you can specify the physical *width* of the
+     panel with a value suffixed by either "m", "mm", "cm" or "in".
+
+   * `top' (optional) is the offset from the top of all
+     screens. Default unit is meter. You can suffix one of the
+     following unit: "mm", "cm" or "in".
+
+   * `gap' (optional) is the distance between two consecutive screens
+     (gap between panels). Default unit is meter. You can suffix one
+     of the following unit: "mm", "cm" or "in".
+
+Crop specification:
+
+  The format is <width>x<height>(-|+)<x_offset>(-|+)<y_offset>.
+
+  The format follow the geometry syntax used by X11. A negative offset
+  (including -0) refers to the right or the bottom of the image. For
+  example: 2400x1200-0-0 will work on the image zone of size 2400x1200
+  on the lower right corner.
+
+Gravity
+
+  With the --xcenter and --ycenter option, you can choose how to
+  center the screens on the source image. The default is to take the
+  center of the image if the screens doesn't cover it all.
+
+  A gravity of 0 means either top or left alignment in the image.
+  A gravity of 1 means either right or bottom alignment in the image.
+  A gravity of 0.5 means the center of the image.
+
+Examples:
+
+  If you have 2 monitors with different resolutions and you don't care
+  about the gap between them nor the top alignement, you can use
+  something like this:
+
+    {0} --screen 2560x1440/59.8cm --screen 1680x1050/46.4cm landscape.png wallpaper.png
+
+  A more complex example, if you have 3 machines, with 4 monitors
+  total (1 on the first, 2 on the middle one, and 1 on the last one),
+  and if you measure how they are aligned vertically and the gap
+  between them (from panel to panel), you can use something like this:
+
+    {0} --screen 1920x1200/20.5in \\
+        --then --screen 2560x1440/59.8cm@1.5cm+15cm --screen 1680x1050/46.4cm@5.5cm+4.5cm \\
+        --then --screen 1920x1080/93.7dpi+8cm \\
+        landscape.png wallpaper.png
+
+  The above command will produce 3 images:
+
+     1_wallpaper.png, 2_wallpaper.png, 3_wallpaper.png.
+
+  You can then setup each wallpaper on each machine, and the source
+  image should be nicely spread accross all your monitors.
+
+Reports bugs to <frederic@jolliton.com>\
+""".format(sys.argv[0]))
+    sys.exit(rc)
+
+def main():
+    opts = 'hs:tpvx:y:S:C:'
+    longopts = ('help', 'screen=', 'then', 'pretend', 'verbose', 'xcenter=', 'ycenter=', 'scale=', 'crop=')
+    try:
+        options, arguments = getopt.getopt(sys.argv[1:], opts, longopts)
+    except getopt.GetoptError as e:
+        print(e)
+        exit_with_usage(1)
+
+    screens = [[]]
+    verbose = False
+    pretend = False
+    gravity_x = 0.5
+    gravity_y = 0.5
+    scale = 1.0
+    region = None
+    for option, argument in options:
+        if option in ('-h', '--help'):
+            exit_with_usage(0)
+        elif option in ('-s', '--screen'):
+            screens[-1].append(parse_screen_spec(argument))
+        elif option in ('-t', '--then'):
+            if screens[-1]:
+                screens.append([])
+        elif option in ('-p', '--pretend'):
+            pretend = True
+        elif option in ('-v', '--verbose'):
+            verbose = True
+        elif option in ('-x', '--xcenter'):
+            gravity_x = float(argument)
+        elif option in ('-y', '--ycenter'):
+            gravity_y = float(argument)
+        elif option in ('-S', '--scale'):
+            scale = float(argument)
+            if scale < 1.0:
+                exit_with_usage(1)
+        elif option in ('-C', '--crop'):
+            region = parse_region(argument)
+            if not region:
+                exit_with_usage(1)
+        else:
+            raise RuntimeError('Unexpected option {!r}'.format(option))
+    if not screens[-1]:
+        del screens[-1]
+
+    if not screens:
+        exit_with_usage(1)
+
+    if len(arguments) != 2:
+        exit_with_usage(1)
+
+    src, dst = arguments
+    process(src, dst, screens,
+            gravity_x=gravity_x, gravity_y=gravity_y, scale=scale, region=region,
+            pretend=pretend, verbose=verbose)
+
+if __name__ == '__main__':
+    main()
